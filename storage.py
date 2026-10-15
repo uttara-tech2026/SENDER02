@@ -1,84 +1,145 @@
 """
-Minimal JSON-file persistence.
+SQLite storage for the relay bot (stdlib only, no extra dependency).
 
-State this bot remembers:
-  - which media items it has already seen (by Telegram's
-    file_unique_id), so it can tell a sender whether their item is a
-    duplicate
-  - a running count of how many non-duplicate media items have been
-    sent to the admin in total
-
-Everything is global -- there's no per-chat/per-user split, since every
-sender funnels into the same admin relay.
-
-{
-  "seen_unique_ids": [str, ...],
-  "media_sent_count": int
-}
+Keeps record_media() compatible with the old version, plus users/roles,
+settings (destination, route, caption, delays) and counters for stats.
+All functions are async to match the old API, but SQLite calls are tiny
+and run directly on the event loop thread.
 """
 
-import json
-import os
-import asyncio
+import sqlite3
+import time
 
 import config
 
-_lock = asyncio.Lock()
-_data = None
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS media (
+    unique_id TEXT PRIMARY KEY,
+    sender_id INTEGER,
+    created   REAL
+);
+CREATE TABLE IF NOT EXISTS users (
+    user_id  INTEGER PRIMARY KEY,
+    name     TEXT,
+    username TEXT,
+    role     TEXT NOT NULL DEFAULT 'pending',
+    joined   REAL
+);
+CREATE TABLE IF NOT EXISTS settings (
+    key   TEXT PRIMARY KEY,
+    value TEXT
+);
+CREATE TABLE IF NOT EXISTS stats (
+    key   TEXT PRIMARY KEY,
+    value INTEGER NOT NULL DEFAULT 0
+);
+"""
+
+_db = None
 
 
-def _default():
-    return {"seen_unique_ids": [], "media_sent_count": 0}
+def _conn() -> sqlite3.Connection:
+    global _db
+    if _db is None:
+        _db = sqlite3.connect(getattr(config, "DB_PATH", "relay.db"))
+        _db.row_factory = sqlite3.Row
+        _db.executescript(SCHEMA)
+        _db.commit()
+    return _db
 
 
-def _load():
-    global _data
-    if _data is not None:
-        return _data
-    if os.path.exists(config.DATA_FILE):
-        try:
-            with open(config.DATA_FILE, "r", encoding="utf-8") as f:
-                _data = json.load(f)
-        except (json.JSONDecodeError, OSError):
-            _data = _default()
+# ------------------------------------------------------------------ media
+async def record_media(unique_id: str, sender_id: int | None = None):
+    """Returns (is_new, total_unique_count)."""
+    db = _conn()
+    cur = db.execute(
+        "INSERT OR IGNORE INTO media (unique_id, sender_id, created) VALUES (?, ?, ?)",
+        (unique_id, sender_id, time.time()),
+    )
+    db.commit()
+    total = db.execute("SELECT COUNT(*) FROM media").fetchone()[0]
+    return cur.rowcount > 0, total
+
+
+async def count_media() -> int:
+    return _conn().execute("SELECT COUNT(*) FROM media").fetchone()[0]
+
+
+# ------------------------------------------------------------------ users
+async def upsert_user(user_id: int, name: str, username: str | None) -> bool:
+    """Insert or refresh a user. Returns True if the user was newly created."""
+    db = _conn()
+    exists = db.execute("SELECT 1 FROM users WHERE user_id=?", (user_id,)).fetchone()
+    if exists:
+        db.execute(
+            "UPDATE users SET name=?, username=? WHERE user_id=?",
+            (name, username, user_id),
+        )
     else:
-        _data = _default()
-    _data.setdefault("seen_unique_ids", [])
-    _data.setdefault("media_sent_count", 0)
-    return _data
+        db.execute(
+            "INSERT INTO users (user_id, name, username, role, joined) VALUES (?, ?, ?, 'pending', ?)",
+            (user_id, name, username, time.time()),
+        )
+    db.commit()
+    return not exists
 
 
-def _save():
-    tmp = config.DATA_FILE + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(_data, f, indent=2)
-    os.replace(tmp, config.DATA_FILE)
+async def get_user(user_id: int):
+    row = _conn().execute("SELECT * FROM users WHERE user_id=?", (user_id,)).fetchone()
+    return dict(row) if row else None
 
 
-async def record_media(unique_id: str) -> tuple:
-    """Atomically check whether unique_id has been seen before and, if
-    not, record it and bump the running sent-count.
+async def set_role(user_id: int, role: str):
+    db = _conn()
+    db.execute("UPDATE users SET role=? WHERE user_id=?", (role, user_id))
+    db.commit()
 
-    Returns (is_new, media_sent_count):
-      - is_new=True  -> brand-new item, caller should relay it;
-                        media_sent_count is the new total (includes this one)
-      - is_new=False -> duplicate, caller should not relay it again;
-                        media_sent_count is the total unchanged by this call
 
-    Doing the check-and-mark under a single lock (rather than a separate
-    is_duplicate() + mark_seen()) avoids a race where two near-identical
-    uploads arriving at the same instant both pass the check before
-    either has recorded itself.
-    """
-    async with _lock:
-        data = _load()
-        seen = data["seen_unique_ids"]
-        if unique_id in seen:
-            return False, data["media_sent_count"]
-        seen.append(unique_id)
-        # keep this bounded so the JSON file doesn't grow forever
-        if len(seen) > 5000:
-            data["seen_unique_ids"] = seen[-5000:]
-        data["media_sent_count"] += 1
-        _save()
-        return True, data["media_sent_count"]
+async def list_users(role: str | None = None):
+    order = (
+        "ORDER BY CASE role WHEN 'pending' THEN 0 WHEN 'sender' THEN 1 "
+        "WHEN 'receiver' THEN 2 ELSE 3 END, joined"
+    )
+    if role:
+        rows = _conn().execute(f"SELECT * FROM users WHERE role=? {order}", (role,)).fetchall()
+    else:
+        rows = _conn().execute(f"SELECT * FROM users {order}").fetchall()
+    return [dict(r) for r in rows]
+
+
+# --------------------------------------------------------------- settings
+async def get_setting(key: str, default=None):
+    row = _conn().execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+    return row["value"] if row else default
+
+
+async def set_setting(key: str, value):
+    db = _conn()
+    db.execute(
+        "INSERT INTO settings (key, value) VALUES (?, ?) "
+        "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        (key, str(value)),
+    )
+    db.commit()
+
+
+async def del_setting(key: str):
+    db = _conn()
+    db.execute("DELETE FROM settings WHERE key=?", (key,))
+    db.commit()
+
+
+# ------------------------------------------------------------------ stats
+async def incr(key: str, n: int = 1):
+    db = _conn()
+    db.execute(
+        "INSERT INTO stats (key, value) VALUES (?, ?) "
+        "ON CONFLICT(key) DO UPDATE SET value = value + excluded.value",
+        (key, n),
+    )
+    db.commit()
+
+
+async def all_stats() -> dict:
+    rows = _conn().execute("SELECT key, value FROM stats").fetchall()
+    return {r["key"]: r["value"] for r in rows}
