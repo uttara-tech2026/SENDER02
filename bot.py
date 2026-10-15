@@ -9,6 +9,11 @@ Flow
         receivers | destination (a channel/group/chat) | both
   * Every target (each receiver + the destination) has its OWN queue,
     worker and delay, so they are rate-limited independently.
+  * Two kinds of delay, both set by the admin per receiver / all receivers /
+    destination:
+        - Send interval : pause between one send and the next (/delay)
+        - Delivery delay: how long new media is HELD before it reaches that
+                          target for the first time (/hold)
   * When all queued work is finished, the admin gets a completion
     message with stats.
   * Admin panel (/admin): users & roles, destination & route, delays,
@@ -115,8 +120,45 @@ async def default_delay() -> float:
 
 
 async def get_delay(key: str) -> float:
+    """Priority: own override > group delay (all receivers) > default."""
     v = await storage.get_setting(f"delay:{key}")
+    if v is None and key.startswith("r:"):
+        v = await storage.get_setting("delay:receivers")
     return float(v) if v is not None else await default_delay()
+
+
+async def delay_label(key: str) -> str:
+    if key == "default":
+        return "the default delay"
+    if key == "receivers":
+        return "ALL receivers"
+    if key == "dest":
+        return await target_label("dest")
+    return await target_label(key)
+
+
+async def current_delay(key: str) -> float:
+    if key == "default":
+        return await default_delay()
+    if key == "receivers":
+        v = await storage.get_setting("delay:receivers")
+        return float(v) if v is not None else await default_delay()
+    return await get_delay(key)
+
+
+async def get_hold(key: str) -> float:
+    """Delivery (hold) delay. Priority: own override > all receivers > 0."""
+    v = await storage.get_setting(f"hold:{key}")
+    if v is None and key.startswith("r:"):
+        v = await storage.get_setting("hold:receivers")
+    return float(v) if v is not None else 0.0
+
+
+async def current_hold(key: str) -> float:
+    if key == "receivers":
+        v = await storage.get_setting("hold:receivers")
+        return float(v) if v is not None else 0.0
+    return await get_hold(key)
 
 
 async def resolve_chat(key: str):
@@ -229,6 +271,11 @@ async def target_worker(app: Application, key: str):
     while True:
         state["status"] = "idle"
         job = await q.get()
+        # Delivery delay: hold the job until its release time.
+        wait = job.get("not_before", 0) - time.time()
+        if wait > 0:
+            state["status"] = f"holding ({duration(wait)} left)"
+            await asyncio.sleep(wait)
         state["status"] = "sending"
         try:
             ok = await send_job(app.bot, key, job)
@@ -353,7 +400,9 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
     job = {"type": media_type, "file_id": file_id, "count": total_count, "sender": user.full_name}
     for key in targets:
         ensure_worker(context.application, key)
-        queues[key].put_nowait(dict(job))
+        j = dict(job)
+        j["not_before"] = time.time() + await get_hold(key)  # admin's delivery delay
+        queues[key].put_nowait(j)
         pending_jobs += 1
 
     logger.info(f"Queued {media_type} ({unique_id}) for {len(targets)} target(s), total={total_count}")
@@ -406,7 +455,8 @@ def main_menu():
     kb = Markup(
         [
             [Btn("👥 Users", callback_data="menu:users"), Btn("🎯 Destination", callback_data="menu:dest")],
-            [Btn("⏱ Delays", callback_data="menu:delay"), Btn("📝 Caption", callback_data="menu:caption")],
+            [Btn("⏱ Send interval", callback_data="menu:delay"), Btn("⏳ Delivery delay", callback_data="menu:hold")],
+            [Btn("📝 Caption", callback_data="menu:caption")],
             [Btn("📊 Stats", callback_data="menu:stats"), Btn("⚙️ Processes", callback_data="menu:proc")],
         ]
     )
@@ -471,18 +521,59 @@ async def view_dest():
 
 async def view_delay():
     default = await default_delay()
-    rows = [[Btn(f"🌐 Default: {default:g}s", callback_data="delay:default")]]
+    group = await storage.get_setting("delay:receivers")
+    dest = await storage.get_setting("delay:dest")
+    rows = [
+        [Btn(f"🌐 Default: {default:g}s", callback_data="delay:default")],
+        [Btn(f"👥 All receivers: {float(group):g}s" if group is not None else "👥 All receivers: default",
+             callback_data="delay:receivers")],
+        [Btn(f"📢 Destination: {float(dest):g}s" if dest is not None else "📢 Destination: default",
+             callback_data="delay:dest")],
+    ]
     for key in await configured_targets():
+        if key == "dest":
+            continue
         v = await storage.get_setting(f"delay:{key}")
         label = await target_label(key)
-        rows.append(
-            [Btn(f"{label} — {float(v):g}s"[:60] if v is not None else f"{label} — default"[:60],
-                 callback_data=f"delay:{key}")]
-        )
+        shown = f"{float(v):g}s" if v is not None else "inherits"
+        rows.append([Btn(f"{label} — {shown}"[:60], callback_data=f"delay:{key}")])
     rows.append(back_row())
     text = (
-        "⏱ <b>Delays</b>\nDelay between sends, set per receiver / destination. "
-        "Targets without their own value use the default."
+        "⏱ <b>Delays</b>\nDelay between sends (seconds).\n\n"
+        "• <b>Destination</b> has its own delay.\n"
+        "• <b>All receivers</b> sets one delay for every receiver.\n"
+        "• A single receiver below can override it; otherwise it inherits "
+        "the receivers delay, then the default."
+    )
+    return text, Markup(rows)
+
+
+async def view_hold():
+    group = await storage.get_setting("hold:receivers")
+    dest = await storage.get_setting("hold:dest")
+    rows = [
+        [Btn(f"👥 All receivers: {float(group):g}s" if group is not None else "👥 All receivers: none",
+             callback_data="hold:receivers")],
+        [Btn(f"📢 Destination: {float(dest):g}s" if dest is not None else "📢 Destination: none",
+             callback_data="hold:dest")],
+    ]
+    for key in await configured_targets():
+        if key == "dest":
+            continue
+        v = await storage.get_setting(f"hold:{key}")
+        label = await target_label(key)
+        shown = f"{float(v):g}s" if v is not None else "inherits"
+        rows.append([Btn(f"{label} — {shown}"[:60], callback_data=f"hold:{key}")])
+    rows.append(back_row())
+    text = (
+        "⏳ <b>Delivery delay</b>\n"
+        "How long new media is held before it is delivered to a target "
+        "(applies to media queued after the change).\n\n"
+        "• <b>Destination</b> has its own delivery delay.\n"
+        "• <b>All receivers</b> sets one delay for every receiver.\n"
+        "• A single receiver below can override it; otherwise it inherits "
+        "the receivers delay (default: no delay).\n\n"
+        "<i>The send interval (time between sends) is under ⏱ Send interval.</i>"
     )
     return text, Markup(rows)
 
@@ -563,7 +654,8 @@ async def build_processes() -> str:
         lines.append(
             f"{'🟢' if alive else '🔴'} {esc(await target_label(key))}\n"
             f"    status: {esc(st.get('status', '?'))} · queue: {q.qsize() if q else 0} · "
-            f"delay: {await get_delay(key):g}s · last send: {ago(st.get('last'))}"
+            f"interval: {await get_delay(key):g}s · hold: {await get_hold(key):g}s · "
+            f"last send: {ago(st.get('last'))}"
         )
     return "\n".join(lines)
 
@@ -612,6 +704,20 @@ async def cmd_process(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text(text, reply_markup=kb, parse_mode=HTML)
 
 
+async def cmd_delay(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await admin_only(update):
+        return
+    text, kb = await view_delay()
+    await update.effective_message.reply_text(text, reply_markup=kb, parse_mode=HTML)
+
+
+async def cmd_hold(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await admin_only(update):
+        return
+    text, kb = await view_hold()
+    await update.effective_message.reply_text(text, reply_markup=kb, parse_mode=HTML)
+
+
 async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await admin_only(update):
         return
@@ -641,6 +747,8 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await show(q, *await view_dest())
     elif data == "menu:delay":
         await show(q, *await view_delay())
+    elif data == "menu:hold":
+        await show(q, *await view_hold())
     elif data == "menu:caption":
         await show(q, *await view_caption())
     elif data == "menu:stats":
@@ -685,13 +793,24 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data.startswith("delay:"):
         key = data[len("delay:"):]
-        label = "the default delay" if key == "default" else await target_label(key)
-        current = await default_delay() if key == "default" else await get_delay(key)
+        label = await delay_label(key)
+        current = await current_delay(key)
         extra = "" if key == "default" else "\nSend <code>reset</code> to use the default again."
         await prompt(
             q, context, f"delay:{key}",
             f"⏱ Send the delay in seconds for <b>{esc(label)}</b> (now {current:g}s). "
             f"Example: <code>2.5</code>{extra}",
+        )
+
+    elif data.startswith("hold:"):
+        key = data[len("hold:"):]
+        label = await delay_label(key)
+        current = await current_hold(key)
+        await prompt(
+            q, context, f"hold:{key}",
+            f"⏳ Send the delivery delay in seconds for <b>{esc(label)}</b> (now {current:g}s). "
+            f"Media will be held this long before it is delivered. Example: <code>30</code>\n"
+            f"Send <code>reset</code> to remove the override.",
         )
 
     elif data == "cap:toggle":
@@ -747,6 +866,24 @@ async def handle_admin_input(update: Update, context: ContextTypes.DEFAULT_TYPE,
         await storage.set_setting(setting_key, value)
         await msg.reply_text(f"✅ Delay set to {value:g}s.", reply_markup=panel)
 
+    elif awaiting.startswith("hold:"):
+        key = awaiting[len("hold:"):]
+        setting_key = f"hold:{key}"
+        if text.lower() == "reset":
+            await storage.del_setting(setting_key)
+            await msg.reply_text("✅ Delivery delay removed.", reply_markup=panel)
+            return
+        try:
+            value = float(text)
+            if not 0 <= value <= 86400:
+                raise ValueError
+        except ValueError:
+            context.user_data["awaiting"] = awaiting  # keep waiting
+            await msg.reply_text("❌ Send a number of seconds between 0 and 86400 (or /cancel).")
+            return
+        await storage.set_setting(setting_key, value)
+        await msg.reply_text(f"✅ Delivery delay set to {value:g}s.", reply_markup=panel)
+
     elif awaiting == "caption":
         await storage.set_setting("caption_text", text[:1024])
         await storage.set_setting("caption_on", "1")
@@ -776,6 +913,8 @@ def main():
     app.add_handler(CommandHandler(["admin", "panel"], cmd_admin, filters=private))
     app.add_handler(CommandHandler("stats", cmd_stats, filters=private))
     app.add_handler(CommandHandler("process", cmd_process, filters=private))
+    app.add_handler(CommandHandler("delay", cmd_delay, filters=private))
+    app.add_handler(CommandHandler("hold", cmd_hold, filters=private))
     app.add_handler(CommandHandler("cancel", cmd_cancel, filters=private))
     app.add_handler(CallbackQueryHandler(on_button))
     app.add_handler(MessageHandler(private & (filters.PHOTO | filters.VIDEO), handle_media))
